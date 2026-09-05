@@ -41,7 +41,6 @@ export default {
         "User-Agent":
           "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
         "Referer": embedUrl,
         "X-Forwarded-For": clientIp,
         "CF-Connecting-IP": clientIp,
@@ -69,11 +68,9 @@ export default {
         );
       }
 
-      // 3. Multi-Strategy Dynamic Token Extraction
+      // 3. Dynamic Token Extraction
       let gateUrl = null;
 
-      // Strategy 1: Substring obfuscation match
-      // Pattern: ('xy...').substring(X)
       const subMatch = html.match(/\+\s*\(?['"]([^'"]+)['"]\)?\.substring\((\d+)\)/);
       const basePartMatch = html.match(/['"]((?:https:)?\/\/streamtape\.to\/get_video\?[^'"]+)['"]/);
 
@@ -86,7 +83,6 @@ export default {
         gateUrl = `${basePart}&token=${token}`;
       }
 
-      // Strategy 2: Direct innerHTML assignment search
       if (!gateUrl) {
         const innerMatch = html.match(/innerHTML\s*=\s*(.*?);/g);
         if (innerMatch) {
@@ -103,20 +99,10 @@ export default {
         }
       }
 
-      // Strategy 3: Global HTML parameter scan
       if (!gateUrl) {
         const queryParamsMatch = html.match(/get_video\?(id=[^&'"]+&expires=\d+&ip=[^&'"]+&token=[a-zA-Z0-9_\-]+)/);
         if (queryParamsMatch) {
           gateUrl = `https://streamtape.to/get_video?${queryParamsMatch[1]}`;
-        }
-      }
-
-      // Strategy 4: Fallback concatenation search
-      if (!gateUrl) {
-        const idExpIp = html.match(/get_video\?(id=[^&'"]+&expires=[^&'"]+&ip=[^&'"]+)/);
-        const tokOnly = html.match(/['"](?:&|\?)token=([^'"]+)['"]/);
-        if (idExpIp && tokOnly) {
-          gateUrl = `https://streamtape.to/get_video?${idExpIp[1]}&token=${tokOnly[1]}`;
         }
       }
 
@@ -134,7 +120,7 @@ export default {
         gateUrl += "&stream=1";
       }
 
-      // 4. Resolve Tapecontent CDN Location (Server side)
+      // 4. Resolve Final Tapecontent CDN URL
       const gateRes = await fetch(gateUrl, {
         headers: {
           "User-Agent": upstreamHeaders["User-Agent"],
@@ -153,35 +139,52 @@ export default {
         cdnStreamUrl = "https:" + ("//" + cdnStreamUrl.replace(/^\/+/, ""));
       }
 
-      // 5. DIRECT STREAM PLAYBACK (No Redirect to tapecontent)
-      // Client Range Header forward karte hain taaki forward/rewind aur video scrubbing work kare
-      const streamHeaders = new Headers();
-      streamHeaders.set("User-Agent", upstreamHeaders["User-Agent"]);
-      streamHeaders.set("Referer", embedUrl);
+      // 5. Build Upstream Stream Request with Browser Range
+      const streamReqHeaders = {
+        "User-Agent": upstreamHeaders["User-Agent"],
+        "Referer": embedUrl,
+      };
 
-      const clientRange = request.headers.get("Range");
-      if (clientRange) {
-        streamHeaders.set("Range", clientRange);
+      const range = request.headers.get("range");
+      if (range) {
+        streamReqHeaders["Range"] = range;
       }
 
-      // Worker directly fetches binary stream from CDN
-      const videoPipe = await fetch(cdnStreamUrl, {
-        headers: streamHeaders,
+      const cdnRes = await fetch(cdnStreamUrl, {
+        headers: streamReqHeaders,
+        redirect: "follow",
       });
 
-      // Headers prepare karein for native video playback
-      const responseHeaders = new Headers(videoPipe.headers);
+      // Agar upstream 403 fek raha ho to error return karein taaki broken screen na aaye
+      if (cdnRes.status === 403) {
+        return new Response(
+          JSON.stringify({
+            status: "error",
+            message: "Streamtape CDN returned 403 Forbidden. IP lock active.",
+            direct_cdn_url: cdnStreamUrl
+          }),
+          { status: 403, headers: { "content-type": "application/json", "Access-Control-Allow-Origin": "*" } }
+        );
+      }
+
+      // 6. Deliver Proper Video Headers for Chrome/ExoPlayer
+      const responseHeaders = new Headers();
       responseHeaders.set("Content-Type", "video/mp4");
       responseHeaders.set("Accept-Ranges", "bytes");
       responseHeaders.set("Access-Control-Allow-Origin", "*");
+      responseHeaders.set("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS");
       responseHeaders.set("Access-Control-Allow-Headers", "*");
-      responseHeaders.set("Access-Control-Expose-Headers", "Content-Length, Content-Range, Accept-Ranges");
-      responseHeaders.set("Cache-Control", "no-cache, no-store, must-revalidate");
 
-      // Raw binary stream response client ko return karein
-      return new Response(videoPipe.body, {
-        status: videoPipe.status,
-        statusText: videoPipe.statusText,
+      if (cdnRes.headers.has("Content-Length")) {
+        responseHeaders.set("Content-Length", cdnRes.headers.get("Content-Length"));
+      }
+      if (cdnRes.headers.has("Content-Range")) {
+        responseHeaders.set("Content-Range", cdnRes.headers.get("Content-Range"));
+      }
+
+      return new Response(cdnRes.body, {
+        status: cdnRes.status,
+        statusText: cdnRes.statusText,
         headers: responseHeaders,
       });
 
