@@ -12,105 +12,132 @@ export default {
         }, null, 2),
         {
           status: 400,
-          headers: { "content-type": "application/json; charset=utf-8" },
+          headers: { "content-type": "application/json; charset=utf-8" }
         }
       );
     }
 
-    try {
-      const idMatch = targetUrl.match(/\/(?:v|e)\/([a-zA-Z0-9]+)/);
-      if (!idMatch) {
-        return new Response(
-          JSON.stringify({ status: "error", message: "Invalid Streamtape URL format." }),
-          { status: 400, headers: { "content-type": "application/json" } }
-        );
-      }
+    const idMatch = targetUrl.match(/\/(?:v|e)\/([a-zA-Z0-9]+)/);
+    if (!idMatch) {
+      return new Response(
+        JSON.stringify({ status: "error", message: "Invalid Streamtape URL format." }),
+        { status: 400, headers: { "content-type": "application/json" } }
+      );
+    }
 
-      const videoId = idMatch[1];
-      const embedUrl = `https://streamtape.to/e/${videoId}`;
+    const videoId = idMatch[1];
+    const embedUrl = `https://streamtape.to/e/${videoId}`;
 
-      const browserHeaders = {
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Referer": embedUrl,
-      };
-
-      const embedRes = await fetch(embedUrl, { headers: browserHeaders });
-      if (!embedRes.ok) {
-        return new Response(`Upstream fetch failed: ${embedRes.status}`, { status: 502 });
-      }
-
-      const html = await embedRes.text();
-
-      // Real token extract karein
-      const jsMatch = html.match(/document\.getElementById\(['"][^'"]+['"]\)\.innerHTML\s*=\s*(.*?);/);
-      if (!jsMatch) {
-        return new Response("Dynamic JS token not found.", { status: 500 });
-      }
-
-      const jsExpr = jsMatch[1];
-      const paramMatch = jsExpr.match(/get_video\?(id=[^&'"]+&expires=[^&'"]+&ip=[^&'"]+&token=[^&'"]+)/) ||
-                         jsExpr.match(/get_video\?([^'"]+)/);
-
-      if (!paramMatch) {
-        return new Response("Parameters missing.", { status: 500 });
-      }
-
-      let gateUrl = `https://streamtape.to/get_video?${paramMatch[1]}`;
-      if (!gateUrl.includes("stream=1")) {
-        gateUrl += "&stream=1";
-      }
-
-      // Clean, ad-free standalone HTML5 web player return karein
-      const playerHtml = `<!DOCTYPE html>
+    // Ye HTML page user ke browser me load hokar user ki original IP se token request execute karega
+    const clientResolverHtml = `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Direct Player</title>
+  <title>Streaming Video...</title>
   <style>
-    * { box-sizing: border-box; }
-    html, body {
-      margin: 0;
-      padding: 0;
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body, html {
       width: 100%;
       height: 100%;
-      background-color: #0b0f19;
+      background: #000;
+      overflow: hidden;
       display: flex;
       align-items: center;
       justify-content: center;
-      overflow: hidden;
-      font-family: system-ui, -apple-system, sans-serif;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      color: #fff;
+    }
+    #status-box {
+      text-align: center;
+      padding: 20px;
+    }
+    .spinner {
+      width: 42px;
+      height: 42px;
+      border: 3px solid rgba(255,255,255,0.2);
+      border-top-color: #3b82f6;
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+      margin: 0 auto 16px;
+    }
+    @keyframes spin {
+      to { transform: rotate(360deg); }
     }
     video {
       width: 100%;
       height: 100%;
       object-fit: contain;
       background: #000;
+      display: none;
     }
   </style>
 </head>
 <body>
-  <video id="vPlayer" controls autoplay playsinline preload="auto">
-    <source src="${gateUrl}" type="video/mp4">
-    Your browser does not support HTML5 video streaming.
-  </video>
+
+  <div id="status-box">
+    <div class="spinner"></div>
+    <p id="msg">Resolving stream from your IP...</p>
+  </div>
+
+  <video id="player" controls autoplay playsinline preload="auto"></video>
+
+  <script>
+    const targetEmbed = "${embedUrl}";
+
+    async function initClientStream() {
+      const msg = document.getElementById("msg");
+      const statusBox = document.getElementById("status-box");
+      const player = document.getElementById("player");
+
+      try {
+        msg.innerText = "Fetching video token...";
+
+        // User ke phone/browser se embed page read karte hain (CORS bypass proxy ke zariye)
+        const fetchUrl = "https://api.allorigins.win/raw?url=" + encodeURIComponent(targetEmbed);
+        const res = await fetch(fetchUrl);
+        if (!res.ok) throw new Error("Failed to load embed page");
+
+        const html = await res.text();
+
+        // Real JS token expression extract karein
+        const jsMatch = html.match(/document\\.getElementById\\(['"][^'"]+['"]\\)\\.innerHTML\\s*=\\s*(.*?);/);
+        if (!jsMatch) throw new Error("Token script not found");
+
+        const jsExpr = jsMatch[1];
+        const paramMatch = jsExpr.match(/get_video\\?(id=[^&'"]+&expires=[^&'"]+&ip=[^&'"]+&token=[^&'"]+)/) ||
+                           jsExpr.match(/get_video\\?([^'"]+)/);
+
+        if (!paramMatch) throw new Error("Token parameters missing");
+
+        const finalGateUrl = "https://streamtape.to/get_video?" + paramMatch[1] + "&stream=1";
+
+        msg.innerText = "Connecting to stream...";
+
+        // User ki IP se video load
+        player.src = finalGateUrl;
+        player.style.display = "block";
+        statusBox.style.display = "none";
+        
+        player.play().catch(() => {
+          // Autoplay block hone par user control available rehta hai
+        });
+
+      } catch (err) {
+        msg.innerText = "Playback error: " + err.message;
+      }
+    }
+
+    window.addEventListener("DOMContentLoaded", initClientStream);
+  </script>
 </body>
 </html>`;
 
-      return new Response(playerHtml, {
-        headers: {
-          "content-type": "text/html; charset=utf-8",
-          "Cache-Control": "no-store, no-cache, must-revalidate",
-        },
-      });
-
-    } catch (err) {
-      return new Response(
-        JSON.stringify({ status: "error", message: err.message }),
-        { status: 500, headers: { "content-type": "application/json" } }
-      );
-    }
-  },
+    return new Response(clientResolverHtml, {
+      headers: {
+        "content-type": "text/html; charset=utf-8",
+        "Cache-Control": "no-store, no-cache, must-revalidate"
+      }
+    });
+  }
 };
