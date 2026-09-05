@@ -106,26 +106,39 @@ export default {
         gateUrl += "&stream=1";
       }
 
-      // 4. Follow redirect to get final Tapecontent CDN stream link
-      const gateRes = await fetch(gateUrl, {
-        headers: {
-          "User-Agent": browserHeaders["User-Agent"],
-          "Accept": "*/*",
-          "Referer": embedUrl,
-        },
-        redirect: "manual",
+      // 4. Resolve Final Tapecontent CDN Link
+      // Direct redirect follow karte hain taaki final target pakad sakein
+      const gateHeaders = {
+        "User-Agent": browserHeaders["User-Agent"],
+        "Accept": "*/*",
+        "Referer": embedUrl,
+      };
+
+      let finalCdnUrl = null;
+
+      // Method 1: Follow redirect automatically
+      const followRes = await fetch(gateUrl, {
+        headers: gateHeaders,
+        redirect: "follow",
       });
 
-      let finalCdnUrl = gateRes.headers.get("Location");
-      if (!finalCdnUrl) {
-        finalCdnUrl = gateRes.url;
+      if (followRes.url && followRes.url.includes("tapecontent.net")) {
+        finalCdnUrl = followRes.url;
+      } else {
+        // Method 2: Manual location check agar redirect follow na hua ho
+        const manualRes = await fetch(gateUrl, {
+          headers: gateHeaders,
+          redirect: "manual",
+        });
+        const loc = manualRes.headers.get("location") || manualRes.headers.get("Location");
+        if (loc) {
+          finalCdnUrl = loc.startsWith("http") ? loc : ("https:" + (loc.startsWith("//") ? loc : "//" + loc));
+        } else {
+          finalCdnUrl = followRes.url;
+        }
       }
 
-      if (!finalCdnUrl.startsWith("http")) {
-        finalCdnUrl = "https:" + ("//" + finalCdnUrl.replace(/^\/+/, ""));
-      }
-
-      // 5. Output Pure JSON
+      // 5. Pure Clean JSON Output
       return new Response(
         JSON.stringify({
           status: "success",
