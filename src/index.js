@@ -12,7 +12,10 @@ export default {
         }, null, 2),
         {
           status: 400,
-          headers: { "content-type": "application/json; charset=utf-8" },
+          headers: { 
+            "content-type": "application/json; charset=utf-8",
+            "Access-Control-Allow-Origin": "*"
+          },
         }
       );
     }
@@ -23,26 +26,26 @@ export default {
       if (!idMatch) {
         return new Response(
           JSON.stringify({ status: "error", message: "Invalid Streamtape URL format." }),
-          { status: 400, headers: { "content-type": "application/json" } }
+          { status: 400, headers: { "content-type": "application/json", "Access-Control-Allow-Origin": "*" } }
         );
       }
 
       const videoId = idMatch[1];
       const embedUrl = `https://streamtape.to/e/${videoId}`;
 
-      const browserHeaders = {
+      const clientHeaders = {
         "User-Agent":
           "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept": "*/*",
         "Referer": embedUrl,
       };
 
       // 2. Fetch Embed HTML Page
-      const embedRes = await fetch(embedUrl, { headers: browserHeaders });
+      const embedRes = await fetch(embedUrl, { headers: clientHeaders });
       if (!embedRes.ok) {
         return new Response(
           JSON.stringify({ status: "error", message: `Upstream error: HTTP ${embedRes.status}` }),
-          { status: 502, headers: { "content-type": "application/json" } }
+          { status: 502, headers: { "content-type": "application/json", "Access-Control-Allow-Origin": "*" } }
         );
       }
 
@@ -53,13 +56,13 @@ export default {
       if (!jsMatch) {
         return new Response(
           JSON.stringify({ status: "error", message: "Dynamic JS token generator script not found." }),
-          { status: 500, headers: { "content-type": "application/json" } }
+          { status: 500, headers: { "content-type": "application/json", "Access-Control-Allow-Origin": "*" } }
         );
       }
 
       const jsExpr = jsMatch[1];
 
-      // 4. Extract Query Parameters directly (handles obfuscated domain names like 'xcdbeamtape.to')
+      // 4. Extract Query Parameters
       const paramMatch = jsExpr.match(/get_video\?(id=[^&'"]+&expires=[^&'"]+&ip=[^&'"]+&token=[^&'"]+)/);
       
       let queryString = null;
@@ -75,34 +78,55 @@ export default {
       if (!queryString) {
         return new Response(
           JSON.stringify({ status: "error", message: "Failed to locate token query parameters." }),
-          { status: 500, headers: { "content-type": "application/json" } }
+          { status: 500, headers: { "content-type": "application/json", "Access-Control-Allow-Origin": "*" } }
         );
       }
 
-      // Build clean gate URL targeting working mirror domain
       let gateUrl = `https://streamtape.to/get_video?${queryString}`;
       if (!gateUrl.includes("stream=1")) {
         gateUrl += "&stream=1";
       }
 
-      // 5. Follow 302 Redirect to retrieve the final tapecontent CDN stream
+      // 5. Follow 302 to capture final CDN URL
       const gateRes = await fetch(gateUrl, {
-        headers: {
-          "User-Agent": browserHeaders["User-Agent"],
-          "Referer": embedUrl,
-        },
+        headers: clientHeaders,
         redirect: "follow",
       });
 
       const finalCdnUrl = gateRes.url;
 
-      // 6. Direct Playback: 302 Redirect browser/player to the final CDN MP4 stream
-      return Response.redirect(finalCdnUrl, 302);
+      // 6. Forward Player Headers (especially Range for seeking)
+      const proxyHeaders = new Headers();
+      proxyHeaders.set("User-Agent", clientHeaders["User-Agent"]);
+      proxyHeaders.set("Referer", embedUrl);
+
+      const rangeHeader = request.headers.get("Range");
+      if (rangeHeader) {
+        proxyHeaders.set("Range", rangeHeader);
+      }
+
+      // 7. Pipe / Stream video directly to bypass IP Lock
+      const videoResponse = await fetch(finalCdnUrl, {
+        headers: proxyHeaders,
+      });
+
+      // Prepare response headers for browser/player
+      const responseHeaders = new Headers(videoResponse.headers);
+      responseHeaders.set("Access-Control-Allow-Origin", "*");
+      responseHeaders.set("Access-Control-Allow-Headers", "*");
+      responseHeaders.set("Access-Control-Expose-Headers", "Content-Length, Content-Range, Accept-Ranges");
+      responseHeaders.set("Accept-Ranges", "bytes");
+
+      return new Response(videoResponse.body, {
+        status: videoResponse.status,
+        statusText: videoResponse.statusText,
+        headers: responseHeaders,
+      });
 
     } catch (err) {
       return new Response(
         JSON.stringify({ status: "error", message: err.message }),
-        { status: 500, headers: { "content-type": "application/json" } }
+        { status: 500, headers: { "content-type": "application/json", "Access-Control-Allow-Origin": "*" } }
       );
     }
   },
