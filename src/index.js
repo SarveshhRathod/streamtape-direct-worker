@@ -18,7 +18,7 @@ export default {
     }
 
     try {
-      // 1. Extract Video ID (accepts /v/ or /e/)
+      // 1. Extract Video ID (handles both /v/ and /e/)
       const idMatch = targetUrl.match(/\/(?:v|e)\/([a-zA-Z0-9]+)/);
       if (!idMatch) {
         return new Response(
@@ -38,10 +38,7 @@ export default {
       };
 
       // 2. Fetch Embed HTML Page
-      const embedRes = await fetch(embedUrl, {
-        headers: browserHeaders,
-      });
-
+      const embedRes = await fetch(embedUrl, { headers: browserHeaders });
       if (!embedRes.ok) {
         return new Response(
           JSON.stringify({ status: "error", message: `Upstream error: HTTP ${embedRes.status}` }),
@@ -55,39 +52,40 @@ export default {
       const jsMatch = html.match(/document\.getElementById\(['"][^'"]+['"]\)\.innerHTML\s*=\s*(.*?);/);
       if (!jsMatch) {
         return new Response(
-          JSON.stringify({ status: "error", message: "Dynamic JS token generator not found." }),
+          JSON.stringify({ status: "error", message: "Dynamic JS token generator script not found." }),
           { status: 500, headers: { "content-type": "application/json" } }
         );
       }
 
       const jsExpr = jsMatch[1];
 
-      // 4. Extract Query Parameters (?id=...&expires=...&ip=...&token=...)
-      let gatePath = null;
-      const queryMatch = jsExpr.match(/(\/get_video\?[^'"]+)/);
-
-      if (queryMatch) {
-        gatePath = queryMatch[1];
+      // 4. Extract Query Parameters directly (handles obfuscated domain names like 'xcdbeamtape.to')
+      const paramMatch = jsExpr.match(/get_video\?(id=[^&'"]+&expires=[^&'"]+&ip=[^&'"]+&token=[^&'"]+)/);
+      
+      let queryString = null;
+      if (paramMatch) {
+        queryString = paramMatch[1];
       } else {
-        const fallbackQuery = jsExpr.match(/get_video\?id=[^&]+&expires=\d+&ip=[^&]+&token=[a-zA-Z0-9_-]+/);
-        if (fallbackQuery) {
-          gatePath = "/" + fallbackQuery[0];
+        const looseMatch = jsExpr.match(/get_video\?([^'"]+)/);
+        if (looseMatch) {
+          queryString = looseMatch[1];
         }
       }
 
-      if (!gatePath) {
+      if (!queryString) {
         return new Response(
-          JSON.stringify({ status: "error", message: "Failed to locate token query payload." }),
+          JSON.stringify({ status: "error", message: "Failed to locate token query parameters." }),
           { status: 500, headers: { "content-type": "application/json" } }
         );
       }
 
-      let gateUrl = `https://streamtape.to${gatePath}`;
+      // Build clean gate URL targeting working mirror domain
+      let gateUrl = `https://streamtape.to/get_video?${queryString}`;
       if (!gateUrl.includes("stream=1")) {
-        gateUrl += gateUrl.includes("?") ? "&stream=1" : "?stream=1";
+        gateUrl += "&stream=1";
       }
 
-      // 5. Follow 302 to final tapecontent CDN stream
+      // 5. Follow 302 Redirect to retrieve the final tapecontent CDN stream
       const gateRes = await fetch(gateUrl, {
         headers: {
           "User-Agent": browserHeaders["User-Agent"],
@@ -98,7 +96,7 @@ export default {
 
       const finalCdnUrl = gateRes.url;
 
-      // 6. Direct Play: 302 redirect browser/media player to the fresh CDN stream
+      // 6. Direct Playback: 302 Redirect browser/player to the final CDN MP4 stream
       return Response.redirect(finalCdnUrl, 302);
 
     } catch (err) {
