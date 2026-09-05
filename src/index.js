@@ -28,7 +28,7 @@ export default {
     }
 
     try {
-      // 1. Extract Video ID
+      // 1. Video ID extract karein
       const idMatch = targetUrl.match(/\/(?:v|e)\/([a-zA-Z0-9]+)/);
       if (!idMatch) {
         return new Response(
@@ -51,7 +51,7 @@ export default {
         "CF-Connecting-IP": clientIp,
       };
 
-      // 2. Fetch Embed HTML
+      // 2. Fetch Embed HTML Page
       const embedRes = await fetch(embedUrl, {
         headers: browserHeaders,
         redirect: "follow",
@@ -64,16 +64,20 @@ export default {
         );
       }
 
+      // Capture cookies
+      const rawCookie = embedRes.headers.get("set-cookie") || "";
+      const cookieHeader = rawCookie.split(",").map(c => c.split(";")[0].trim()).filter(Boolean).join("; ");
+
       const html = await embedRes.text();
 
       if (html.includes("Video not found") || html.includes("File was deleted")) {
         return new Response(
-          JSON.stringify({ status: "error", message: "Video not found or file was deleted by Streamtape." }, null, 2),
+          JSON.stringify({ status: "error", message: "Video not found or deleted." }, null, 2),
           { status: 404, headers: { ...corsHeaders, "Content-Type": "application/json; charset=utf-8" } }
         );
       }
 
-      // 3. Dynamic Token Extraction
+      // 3. Dynamic Token Harvester
       let gateUrl = null;
 
       const subMatch = html.match(/\+\s*\(?['"]([^'"]+)['"]\)?\.substring\((\d+)\)/);
@@ -97,7 +101,7 @@ export default {
 
       if (!gateUrl) {
         return new Response(
-          JSON.stringify({ status: "error", message: "Failed to extract dynamic token from Streamtape." }, null, 2),
+          JSON.stringify({ status: "error", message: "Failed to extract dynamic token." }, null, 2),
           { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json; charset=utf-8" } }
         );
       }
@@ -106,45 +110,48 @@ export default {
         gateUrl += "&stream=1";
       }
 
-      // 4. Resolve Final Tapecontent CDN Link
-      // Direct redirect follow karte hain taaki final target pakad sakein
+      // 4. Resolve CDN Link via Range Header Probe
+      // Streamtape HEAD request par redirect nahi deta; isliye GET with Range: bytes=0-0 bhejte hain
       const gateHeaders = {
         "User-Agent": browserHeaders["User-Agent"],
         "Accept": "*/*",
         "Referer": embedUrl,
+        "Range": "bytes=0-0",
       };
 
-      let finalCdnUrl = null;
+      if (cookieHeader) {
+        gateHeaders["Cookie"] = cookieHeader;
+      }
 
-      // Method 1: Follow redirect automatically
-      const followRes = await fetch(gateUrl, {
+      const streamProbe = await fetch(gateUrl, {
+        method: "GET",
         headers: gateHeaders,
         redirect: "follow",
       });
 
-      if (followRes.url && followRes.url.includes("tapecontent.net")) {
-        finalCdnUrl = followRes.url;
-      } else {
-        // Method 2: Manual location check agar redirect follow na hua ho
-        const manualRes = await fetch(gateUrl, {
-          headers: gateHeaders,
-          redirect: "manual",
-        });
-        const loc = manualRes.headers.get("location") || manualRes.headers.get("Location");
-        if (loc) {
-          finalCdnUrl = loc.startsWith("http") ? loc : ("https:" + (loc.startsWith("//") ? loc : "//" + loc));
+      let finalCdnUrl = streamProbe.url;
+
+      // Agar direct URL abhi bhi get_video hai, to response body check karein
+      // (kuch cases me Streamtape redirect ke badle window.location ya intermediate URL deta hai)
+      let debugInfo = "streamProbe ok";
+      if (!finalCdnUrl.includes("tapecontent.net")) {
+        const probeText = await streamProbe.text();
+        const cdnInBody = probeText.match(/https?:\/\/[a-zA-Z0-9_\.\-]*tapecontent\.net[^\s"'<>]+/);
+        if (cdnInBody) {
+          finalCdnUrl = cdnInBody[0];
         } else {
-          finalCdnUrl = followRes.url;
+          debugInfo = `Status: ${streamProbe.status}, Body snippet: ${probeText.slice(0, 150)}`;
         }
       }
 
-      // 5. Pure Clean JSON Output
+      // 5. Output Final Clean JSON
       return new Response(
         JSON.stringify({
           status: "success",
           video_id: videoId,
           gate_url: gateUrl,
           direct_cdn_url: finalCdnUrl,
+          debug: debugInfo,
           timestamp: new Date().toISOString()
         }, null, 2),
         {
