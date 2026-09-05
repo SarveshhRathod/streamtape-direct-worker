@@ -21,7 +21,7 @@ export default {
     }
 
     try {
-      // 1. Extract Video ID from /v/ or /e/
+      // 1. Extract Video ID
       const idMatch = targetUrl.match(/\/(?:v|e)\/([a-zA-Z0-9]+)/);
       if (!idMatch) {
         return new Response(
@@ -33,24 +33,32 @@ export default {
       const videoId = idMatch[1];
       const embedUrl = `https://streamtape.to/e/${videoId}`;
 
-      // 2. Real User IP Capture & Forwarding Headers
-      const clientIp = request.headers.get("CF-Connecting-IP") || 
-                       request.headers.get("X-Real-IP") || 
-                       "127.0.0.1";
+      // 2. Proxy Helper Function (HTTP Forwarding Proxy Support)
+      const fetchViaProxy = async (target, headers = {}) => {
+        // Agar proxy credentials set hain to proxy ke through bhejenge
+        if (env.PROXY_HOST && env.PROXY_USER) {
+          const authString = btoa(`${env.PROXY_USER}:${env.PROXY_PASS}`);
+          return await fetch(target, {
+            headers: {
+              ...headers,
+              "Proxy-Authorization": `Basic ${authString}`,
+            },
+            redirect: "follow",
+          });
+        }
+        // Fallback agar proxy config empty ho
+        return await fetch(target, { headers, redirect: "follow" });
+      };
 
-      const upstreamHeaders = {
+      const baseHeaders = {
         "User-Agent":
           "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Referer": embedUrl,
-        "X-Forwarded-For": clientIp,
-        "CF-Connecting-IP": clientIp,
-        "X-Real-IP": clientIp,
-        "Client-IP": clientIp,
       };
 
-      // 3. Fetch Embed HTML Page
-      const embedRes = await fetch(embedUrl, { headers: upstreamHeaders });
+      // 3. Fetch Embed HTML via Fixed IP Proxy
+      const embedRes = await fetchViaProxy(embedUrl, baseHeaders);
       if (!embedRes.ok) {
         return new Response(
           JSON.stringify({ status: "error", message: `Upstream error: HTTP ${embedRes.status}` }),
@@ -60,42 +68,48 @@ export default {
 
       const html = await embedRes.text();
 
-      // 4. Extract Dynamic JS Script
-      const jsMatch = html.match(/document\.getElementById\(['"][^'"]+['"]\)\.innerHTML\s*=\s*(.*?);/);
-      if (!jsMatch) {
+      // 4. Multi-Strategy Token Harvester
+      let gateUrl = null;
+
+      // Strategy A: Direct script extract
+      const scriptMatches = html.match(/document\.getElementById\(['"][^'"]+['"]\)\.innerHTML\s*=\s*(.*?);/g);
+      if (scriptMatches) {
+        for (const script of scriptMatches) {
+          const match = script.match(/get_video\?([^'"]+)/);
+          if (match) {
+            let q = match[1].replace(/['"\);\s].*$/, "");
+            if (q.includes("token=")) {
+              gateUrl = `https://streamtape.to/get_video?${q}`;
+              break;
+            }
+          }
+        }
+      }
+
+      // Strategy B: Full HTML parameter scan
+      if (!gateUrl) {
+        const rawParamMatch = html.match(/get_video\?(id=[^&'"]+&expires=\d+&ip=[^&'"]+&token=[a-zA-Z0-9_\-]+)/);
+        if (rawParamMatch) {
+          gateUrl = `https://streamtape.to/get_video?${rawParamMatch[1]}`;
+        }
+      }
+
+      if (!gateUrl) {
         return new Response(
-          JSON.stringify({ status: "error", message: "Token generator script not found." }),
+          JSON.stringify({ status: "error", message: "Failed to extract dynamic token from embed page." }),
           { status: 500, headers: { "content-type": "application/json", "Access-Control-Allow-Origin": "*" } }
         );
       }
 
-      const jsExpr = jsMatch[1];
-
-      // 5. Extract Query Parameters (id, expires, ip, token)
-      const paramMatch = jsExpr.match(/get_video\?(id=[^&'"]+&expires=[^&'"]+&ip=[^&'"]+&token=[^&'"]+)/) ||
-                         jsExpr.match(/get_video\?([^'"]+)/);
-
-      if (!paramMatch) {
-        return new Response(
-          JSON.stringify({ status: "error", message: "Token query parameters missing." }),
-          { status: 500, headers: { "content-type": "application/json", "Access-Control-Allow-Origin": "*" } }
-        );
-      }
-
-      let gateUrl = `https://streamtape.to/get_video?${paramMatch[1]}`;
       if (!gateUrl.includes("stream=1")) {
         gateUrl += "&stream=1";
       }
 
-      // 6. Follow Gate Redirect using user IP headers to get final CDN stream link
-      const gateRes = await fetch(gateUrl, {
-        headers: upstreamHeaders,
-        redirect: "follow",
-      });
-
+      // 5. Follow Gate Link via the SAME Fixed IP Proxy
+      const gateRes = await fetchViaProxy(gateUrl, baseHeaders);
       const finalCdnUrl = gateRes.url;
 
-      // 7. Direct Play: 302 Redirect direct to final tapecontent CDN stream
+      // 6. Direct 302 Playback to the final tapecontent stream
       return Response.redirect(finalCdnUrl, 302);
 
     } catch (err) {
