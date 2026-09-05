@@ -57,7 +57,7 @@ npm run deploy
 Returns the final resolved URL and upstream metadata.
 
 ```bash
-curl -i "https://YOUR-WORKER.workers.dev/?mode=json&url=https://example.com/video.mp4"
+curl -i "https://streamtape-direct-worker.sarveshh.workers.dev/?mode=json&url=https://streamtape.com/e/A2Lkva8JqqC4bk/"
 ```
 
 ### Redirect mode
