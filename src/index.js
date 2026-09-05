@@ -1,143 +1,133 @@
 export default {
   async fetch(request, env, ctx) {
+    // Enable CORS for all incoming requests (App / Web player)
+    const corsHeaders = {
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+      "Access-Control-Allow-Headers": "*",
+    };
+
+    if (request.method === "OPTIONS") {
+      return new Response(null, { headers: corsHeaders });
+    }
+
     const requestUrl = new URL(request.url);
     const targetUrl = requestUrl.searchParams.get("url");
+    const outputFormat = requestUrl.searchParams.get("format") || "json";
 
     if (!targetUrl) {
       return new Response(
         JSON.stringify({
           status: "error",
-          message: "No URL provided.",
+          message: "Video URL parameter missing.",
           usage: `${requestUrl.origin}/?url=https://streamtape.com/v/VIDEO_ID/...`
         }, null, 2),
         {
           status: 400,
-          headers: { "content-type": "application/json; charset=utf-8" }
+          headers: { ...corsHeaders, "Content-Type": "application/json; charset=utf-8" },
         }
       );
     }
 
-    const idMatch = targetUrl.match(/\/(?:v|e)\/([a-zA-Z0-9]+)/);
-    if (!idMatch) {
+    try {
+      // 1. Extract Video ID from /v/ or /e/
+      const idMatch = targetUrl.match(/\/(?:v|e)\/([a-zA-Z0-9]+)/);
+      if (!idMatch) {
+        return new Response(
+          JSON.stringify({ status: "error", message: "Invalid Streamtape URL format." }),
+          { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+
+      const videoId = idMatch[1];
+      const embedUrl = `https://streamtape.to/e/${videoId}`;
+
+      const clientIp = request.headers.get("CF-Connecting-IP") || "127.0.0.1";
+      const browserHeaders = {
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Referer": embedUrl,
+        "X-Forwarded-For": clientIp,
+        "CF-Connecting-IP": clientIp,
+      };
+
+      // 2. Fetch Embed HTML Page (~50 KB data)
+      const embedRes = await fetch(embedUrl, { headers: browserHeaders });
+      if (!embedRes.ok) {
+        return new Response(
+          JSON.stringify({ status: "error", message: `Upstream error: HTTP ${embedRes.status}` }),
+          { status: 502, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+
+      const html = await embedRes.text();
+
+      // 3. Extract Real Dynamic Script
+      const jsMatch = html.match(/document\.getElementById\(['"][^'"]+['"]\)\.innerHTML\s*=\s*(.*?);/);
+      if (!jsMatch) {
+        return new Response(
+          JSON.stringify({ status: "error", message: "Token generator script not found in HTML." }),
+          { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+
+      const jsExpr = jsMatch[1];
+
+      // 4. Extract Query Parameters (id, expires, ip, token)
+      const paramMatch = jsExpr.match(/get_video\?(id=[^&'"]+&expires=[^&'"]+&ip=[^&'"]+&token=[^&'"]+)/) ||
+                         jsExpr.match(/get_video\?([^'"]+)/);
+
+      if (!paramMatch) {
+        return new Response(
+          JSON.stringify({ status: "error", message: "Token query parameters missing." }),
+          { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+
+      let gateUrl = `https://streamtape.to/get_video?${paramMatch[1]}`;
+      if (!gateUrl.includes("stream=1")) {
+        gateUrl += "&stream=1";
+      }
+
+      // 5. Follow 302 location to capture final tapecontent CDN stream
+      const gateRes = await fetch(gateUrl, {
+        headers: browserHeaders,
+        redirect: "follow",
+      });
+
+      const finalCdnUrl = gateRes.url;
+
+      // Agar redirect parameter diya ho to direct 302 redirect karein
+      if (outputFormat === "redirect") {
+        return Response.redirect(finalCdnUrl, 302);
+      }
+
+      // Default: Return high-speed JSON payload with final direct CDN URL
       return new Response(
-        JSON.stringify({ status: "error", message: "Invalid Streamtape URL format." }),
-        { status: 400, headers: { "content-type": "application/json" } }
+        JSON.stringify({
+          status: "success",
+          video_id: videoId,
+          cdn_url: finalCdnUrl,
+          stream_url: finalCdnUrl,
+          bandwidth_cost: "micro (~50KB)",
+          generated_at: new Date().toISOString()
+        }, null, 2),
+        {
+          status: 200,
+          headers: {
+            ...corsHeaders,
+            "Content-Type": "application/json; charset=utf-8",
+            "Cache-Control": "no-store, no-cache, must-revalidate"
+          }
+        }
+      );
+
+    } catch (err) {
+      return new Response(
+        JSON.stringify({ status: "error", message: err.message }),
+        { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
       );
     }
-
-    const videoId = idMatch[1];
-    const embedUrl = `https://streamtape.to/e/${videoId}`;
-
-    // Ye HTML page user ke browser me load hokar user ki original IP se token request execute karega
-    const clientResolverHtml = `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Streaming Video...</title>
-  <style>
-    * { margin: 0; padding: 0; box-sizing: border-box; }
-    body, html {
-      width: 100%;
-      height: 100%;
-      background: #000;
-      overflow: hidden;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-      color: #fff;
-    }
-    #status-box {
-      text-align: center;
-      padding: 20px;
-    }
-    .spinner {
-      width: 42px;
-      height: 42px;
-      border: 3px solid rgba(255,255,255,0.2);
-      border-top-color: #3b82f6;
-      border-radius: 50%;
-      animation: spin 0.8s linear infinite;
-      margin: 0 auto 16px;
-    }
-    @keyframes spin {
-      to { transform: rotate(360deg); }
-    }
-    video {
-      width: 100%;
-      height: 100%;
-      object-fit: contain;
-      background: #000;
-      display: none;
-    }
-  </style>
-</head>
-<body>
-
-  <div id="status-box">
-    <div class="spinner"></div>
-    <p id="msg">Resolving stream from your IP...</p>
-  </div>
-
-  <video id="player" controls autoplay playsinline preload="auto"></video>
-
-  <script>
-    const targetEmbed = "${embedUrl}";
-
-    async function initClientStream() {
-      const msg = document.getElementById("msg");
-      const statusBox = document.getElementById("status-box");
-      const player = document.getElementById("player");
-
-      try {
-        msg.innerText = "Fetching video token...";
-
-        // User ke phone/browser se embed page read karte hain (CORS bypass proxy ke zariye)
-        const fetchUrl = "https://api.allorigins.win/raw?url=" + encodeURIComponent(targetEmbed);
-        const res = await fetch(fetchUrl);
-        if (!res.ok) throw new Error("Failed to load embed page");
-
-        const html = await res.text();
-
-        // Real JS token expression extract karein
-        const jsMatch = html.match(/document\\.getElementById\\(['"][^'"]+['"]\\)\\.innerHTML\\s*=\\s*(.*?);/);
-        if (!jsMatch) throw new Error("Token script not found");
-
-        const jsExpr = jsMatch[1];
-        const paramMatch = jsExpr.match(/get_video\\?(id=[^&'"]+&expires=[^&'"]+&ip=[^&'"]+&token=[^&'"]+)/) ||
-                           jsExpr.match(/get_video\\?([^'"]+)/);
-
-        if (!paramMatch) throw new Error("Token parameters missing");
-
-        const finalGateUrl = "https://streamtape.to/get_video?" + paramMatch[1] + "&stream=1";
-
-        msg.innerText = "Connecting to stream...";
-
-        // User ki IP se video load
-        player.src = finalGateUrl;
-        player.style.display = "block";
-        statusBox.style.display = "none";
-        
-        player.play().catch(() => {
-          // Autoplay block hone par user control available rehta hai
-        });
-
-      } catch (err) {
-        msg.innerText = "Playback error: " + err.message;
-      }
-    }
-
-    window.addEventListener("DOMContentLoaded", initClientStream);
-  </script>
-</body>
-</html>`;
-
-    return new Response(clientResolverHtml, {
-      headers: {
-        "content-type": "text/html; charset=utf-8",
-        "Cache-Control": "no-store, no-cache, must-revalidate"
-      }
-    });
-  }
+  },
 };
