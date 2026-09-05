@@ -29,54 +29,32 @@ export default {
       const videoId = idMatch[1];
       const embedUrl = `https://streamtape.to/e/${videoId}`;
 
-      // 1. Client ka original IP extract karein
-      const clientIp = request.headers.get("CF-Connecting-IP") || 
-                       request.headers.get("X-Real-IP") || 
-                       "127.0.0.1";
-
-      // 2. IP forwarding headers inject karein
-      const upstreamHeaders = {
+      const browserHeaders = {
         "User-Agent":
           "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Referer": embedUrl,
-        "X-Forwarded-For": clientIp,
-        "CF-Connecting-IP": clientIp,
-        "X-Real-IP": clientIp,
-        "Client-IP": clientIp,
       };
 
-      // 3. Fetch embed page
-      const embedRes = await fetch(embedUrl, { headers: upstreamHeaders });
+      const embedRes = await fetch(embedUrl, { headers: browserHeaders });
       if (!embedRes.ok) {
-        return new Response(
-          JSON.stringify({ status: "error", message: `Upstream error: HTTP ${embedRes.status}` }),
-          { status: 502, headers: { "content-type": "application/json" } }
-        );
+        return new Response(`Upstream fetch failed: ${embedRes.status}`, { status: 502 });
       }
 
       const html = await embedRes.text();
 
-      // 4. Extract Real JS Script
+      // Real token extract karein
       const jsMatch = html.match(/document\.getElementById\(['"][^'"]+['"]\)\.innerHTML\s*=\s*(.*?);/);
       if (!jsMatch) {
-        return new Response(
-          JSON.stringify({ status: "error", message: "Dynamic JS token generator not found." }),
-          { status: 500, headers: { "content-type": "application/json" } }
-        );
+        return new Response("Dynamic JS token not found.", { status: 500 });
       }
 
       const jsExpr = jsMatch[1];
-
-      // 5. Query parameters extract karein
       const paramMatch = jsExpr.match(/get_video\?(id=[^&'"]+&expires=[^&'"]+&ip=[^&'"]+&token=[^&'"]+)/) ||
                          jsExpr.match(/get_video\?([^'"]+)/);
 
       if (!paramMatch) {
-        return new Response(
-          JSON.stringify({ status: "error", message: "Failed to locate token query parameters." }),
-          { status: 500, headers: { "content-type": "application/json" } }
-        );
+        return new Response("Parameters missing.", { status: 500 });
       }
 
       let gateUrl = `https://streamtape.to/get_video?${paramMatch[1]}`;
@@ -84,14 +62,49 @@ export default {
         gateUrl += "&stream=1";
       }
 
-      // 6. Follow redirect with spoofed IP
-      const gateRes = await fetch(gateUrl, {
-        headers: upstreamHeaders,
-        redirect: "follow",
-      });
+      // Clean, ad-free standalone HTML5 web player return karein
+      const playerHtml = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Direct Player</title>
+  <style>
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      background-color: #0b0f19;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      overflow: hidden;
+      font-family: system-ui, -apple-system, sans-serif;
+    }
+    video {
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      background: #000;
+    }
+  </style>
+</head>
+<body>
+  <video id="vPlayer" controls autoplay playsinline preload="auto">
+    <source src="${gateUrl}" type="video/mp4">
+    Your browser does not support HTML5 video streaming.
+  </video>
+</body>
+</html>`;
 
-      // Direct 302 redirect to final stream link
-      return Response.redirect(gateRes.url, 302);
+      return new Response(playerHtml, {
+        headers: {
+          "content-type": "text/html; charset=utf-8",
+          "Cache-Control": "no-store, no-cache, must-revalidate",
+        },
+      });
 
     } catch (err) {
       return new Response(
