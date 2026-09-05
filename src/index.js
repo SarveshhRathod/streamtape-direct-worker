@@ -8,7 +8,7 @@ export default {
         JSON.stringify({
           status: "error",
           message: "Video URL parameter missing.",
-          usage: `${requestUrl.origin}/?url=https://streamtape.com/v/VIDEO_ID/...`
+          usage: `${requestUrl.origin}/?url=https://streamtape.com/e/VIDEO_ID/`
         }, null, 2),
         {
           status: 400,
@@ -33,22 +33,20 @@ export default {
       const videoId = idMatch[1];
       const embedUrl = `https://streamtape.to/e/${videoId}`;
 
-      const clientIp = request.headers.get("CF-Connecting-IP") || 
-                       request.headers.get("X-Real-IP") || 
-                       "127.0.0.1";
-
-      const upstreamHeaders = {
+      const clientIp = request.headers.get("CF-Connecting-IP") || "127.0.0.1";
+      const browserHeaders = {
         "User-Agent":
           "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
         "Referer": embedUrl,
         "X-Forwarded-For": clientIp,
         "CF-Connecting-IP": clientIp,
       };
 
-      // 2. Fetch Embed HTML Page
+      // 2. Fetch Embed HTML
       const embedRes = await fetch(embedUrl, {
-        headers: upstreamHeaders,
+        headers: browserHeaders,
         redirect: "follow",
       });
 
@@ -68,7 +66,7 @@ export default {
         );
       }
 
-      // 3. Dynamic Token Extraction
+      // 3. Extract Token via Slice Logic
       let gateUrl = null;
 
       const subMatch = html.match(/\+\s*\(?['"]([^'"]+)['"]\)?\.substring\((\d+)\)/);
@@ -84,22 +82,6 @@ export default {
       }
 
       if (!gateUrl) {
-        const innerMatch = html.match(/innerHTML\s*=\s*(.*?);/g);
-        if (innerMatch) {
-          for (const line of innerMatch) {
-            if (!line.includes("get_video")) continue;
-            const fullLink = line.match(/["']((?:https:)?\/\/streamtape\.to\/get_video\?[^"']+)["']/);
-            if (fullLink) {
-              let lk = fullLink[1];
-              if (lk.startsWith("//")) lk = "https:" + lk;
-              gateUrl = lk;
-              break;
-            }
-          }
-        }
-      }
-
-      if (!gateUrl) {
         const queryParamsMatch = html.match(/get_video\?(id=[^&'"]+&expires=\d+&ip=[^&'"]+&token=[a-zA-Z0-9_\-]+)/);
         if (queryParamsMatch) {
           gateUrl = `https://streamtape.to/get_video?${queryParamsMatch[1]}`;
@@ -108,10 +90,7 @@ export default {
 
       if (!gateUrl) {
         return new Response(
-          JSON.stringify({
-            status: "error",
-            message: "Failed to extract dynamic token from Streamtape."
-          }),
+          JSON.stringify({ status: "error", message: "Failed to extract dynamic token from Streamtape." }),
           { status: 500, headers: { "content-type": "application/json", "Access-Control-Allow-Origin": "*" } }
         );
       }
@@ -120,10 +99,10 @@ export default {
         gateUrl += "&stream=1";
       }
 
-      // 4. Resolve Final Tapecontent CDN URL
+      // 4. Follow redirect manually to get final tapecontent CDN stream
       const gateRes = await fetch(gateUrl, {
         headers: {
-          "User-Agent": upstreamHeaders["User-Agent"],
+          "User-Agent": browserHeaders["User-Agent"],
           "Accept": "*/*",
           "Referer": embedUrl,
         },
@@ -139,52 +118,37 @@ export default {
         cdnStreamUrl = "https:" + ("//" + cdnStreamUrl.replace(/^\/+/, ""));
       }
 
-      // 5. Build Upstream Stream Request with Browser Range
-      const streamReqHeaders = {
-        "User-Agent": upstreamHeaders["User-Agent"],
+      // Agar direct playback parameter manga ho ya pipe fail ho raha ho
+      // Streamtape CDN se handshake check karein
+      const testHeaders = {
+        "User-Agent": browserHeaders["User-Agent"],
         "Referer": embedUrl,
       };
-
-      const range = request.headers.get("range");
-      if (range) {
-        streamReqHeaders["Range"] = range;
+      
+      const clientRange = request.headers.get("range");
+      if (clientRange) {
+        testHeaders["Range"] = clientRange;
       }
 
       const cdnRes = await fetch(cdnStreamUrl, {
-        headers: streamReqHeaders,
-        redirect: "follow",
+        headers: testHeaders,
       });
 
-      // Agar upstream 403 fek raha ho to error return karein taaki broken screen na aaye
-      if (cdnRes.status === 403) {
-        return new Response(
-          JSON.stringify({
-            status: "error",
-            message: "Streamtape CDN returned 403 Forbidden. IP lock active.",
-            direct_cdn_url: cdnStreamUrl
-          }),
-          { status: 403, headers: { "content-type": "application/json", "Access-Control-Allow-Origin": "*" } }
-        );
+      // Agar Cloudflare IP ko Tapecontent ne 403 de diya:
+      if (cdnRes.status === 403 || cdnRes.status === 401) {
+        // Fallback: Browser ko direct CDN URL par redirect kar do
+        // User ke mobile browser ka real IP match ho jayega aur video chal jayegi
+        return Response.redirect(cdnStreamUrl, 302);
       }
 
-      // 6. Deliver Proper Video Headers for Chrome/ExoPlayer
-      const responseHeaders = new Headers();
+      // Agar stream OK hai to pipe karein
+      const responseHeaders = new Headers(cdnRes.headers);
       responseHeaders.set("Content-Type", "video/mp4");
       responseHeaders.set("Accept-Ranges", "bytes");
       responseHeaders.set("Access-Control-Allow-Origin", "*");
-      responseHeaders.set("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS");
-      responseHeaders.set("Access-Control-Allow-Headers", "*");
-
-      if (cdnRes.headers.has("Content-Length")) {
-        responseHeaders.set("Content-Length", cdnRes.headers.get("Content-Length"));
-      }
-      if (cdnRes.headers.has("Content-Range")) {
-        responseHeaders.set("Content-Range", cdnRes.headers.get("Content-Range"));
-      }
 
       return new Response(cdnRes.body, {
         status: cdnRes.status,
-        statusText: cdnRes.statusText,
         headers: responseHeaders,
       });
 
