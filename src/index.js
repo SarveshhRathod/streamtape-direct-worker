@@ -7,7 +7,7 @@ export default {
       return new Response(
         JSON.stringify({
           status: "error",
-          message: "Video URL missing.",
+          message: "Video URL parameter missing.",
           usage: `${requestUrl.origin}/?url=https://streamtape.com/v/VIDEO_ID/...`
         }, null, 2),
         {
@@ -33,17 +33,23 @@ export default {
       const videoId = idMatch[1];
       const embedUrl = `https://streamtape.to/e/${videoId}`;
 
-      const headers = {
+      const clientIp = request.headers.get("CF-Connecting-IP") || 
+                       request.headers.get("X-Real-IP") || 
+                       "127.0.0.1";
+
+      const upstreamHeaders = {
         "User-Agent":
           "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
         "Referer": embedUrl,
+        "X-Forwarded-For": clientIp,
+        "CF-Connecting-IP": clientIp,
       };
 
       // 2. Fetch Embed HTML Page
       const embedRes = await fetch(embedUrl, {
-        headers: headers,
+        headers: upstreamHeaders,
         redirect: "follow",
       });
 
@@ -56,58 +62,61 @@ export default {
 
       const html = await embedRes.text();
 
-      // Check if video was removed / deleted
       if (html.includes("Video not found") || html.includes("File was deleted")) {
         return new Response(
-          JSON.stringify({ status: "error", message: "Video not found or has been deleted by Streamtape." }),
+          JSON.stringify({ status: "error", message: "Video not found or file was deleted by Streamtape." }),
           { status: 404, headers: { "content-type": "application/json", "Access-Control-Allow-Origin": "*" } }
         );
       }
 
-      // 3. Extract Real Token via Accurate Script Parsing
-      // Streamtape dynamic line looks like:
-      // document.getElementById('...').innerHTML = "..." + ('...' + '...').substring(X) + ...
+      // 3. Multi-Strategy Dynamic Token Extraction
       let gateUrl = null;
 
-      // Match the main video script block
-      const scriptBlockMatch = html.match(/<script[^>]*>([\s\S]*?innerHTML\s*=[\s\S]*?)<\/script>/gi);
+      // Strategy 1: Substring obfuscation match
+      // Pattern: ('xy...').substring(X)
+      const subMatch = html.match(/\+\s*\(?['"]([^'"]+)['"]\)?\.substring\((\d+)\)/);
+      const basePartMatch = html.match(/['"]((?:https:)?\/\/streamtape\.to\/get_video\?[^'"]+)['"]/);
 
-      if (scriptBlockMatch) {
-        for (const script of scriptBlockMatch) {
-          if (!script.includes("get_video")) continue;
+      if (subMatch && basePartMatch) {
+        let basePart = basePartMatch[1];
+        if (basePart.startsWith("//")) basePart = "https:" + basePart;
+        const rawToken = subMatch[1];
+        const offset = parseInt(subMatch[2], 10);
+        const token = rawToken.substring(offset);
+        gateUrl = `${basePart}&token=${token}`;
+      }
 
-          // Find base link: get_video?id=...&expires=...&ip=...
-          const baseMatch = script.match(/["'](\/\/streamtape\.to\/get_video\?[^"']+)["']/);
-          
-          // Find token part: '...token=...' or '+ ('...' + '...').substring(...)
-          const tokenPartMatch = script.match(/\+\s*\(?['"]([^'"]+)['"]\)?\.substring\((\d+)\)/);
-          const simpleTokenMatch = script.match(/&token=([a-zA-Z0-9_\-]+)/);
-
-          if (baseMatch) {
-            let basePart = baseMatch[1];
-            if (!basePart.startsWith("http")) {
-              basePart = "https:" + basePart;
-            }
-
-            if (tokenPartMatch) {
-              const rawString = tokenPartMatch[1];
-              const sliceCount = parseInt(tokenPartMatch[2], 10);
-              const validToken = rawString.substring(sliceCount);
-              gateUrl = `${basePart}&token=${validToken}`;
-              break;
-            } else if (simpleTokenMatch) {
-              gateUrl = `${basePart}&token=${simpleTokenMatch[1]}`;
+      // Strategy 2: Direct innerHTML assignment search
+      if (!gateUrl) {
+        const innerMatch = html.match(/innerHTML\s*=\s*(.*?);/g);
+        if (innerMatch) {
+          for (const line of innerMatch) {
+            if (!line.includes("get_video")) continue;
+            const fullLink = line.match(/["']((?:https:)?\/\/streamtape\.to\/get_video\?[^"']+)["']/);
+            if (fullLink) {
+              let lk = fullLink[1];
+              if (lk.startsWith("//")) lk = "https:" + lk;
+              gateUrl = lk;
               break;
             }
           }
         }
       }
 
-      // Fallback: If custom slice pattern was not present, look for full reconstructed URL
+      // Strategy 3: Global HTML parameter scan
       if (!gateUrl) {
-        const directMatch = html.match(/["'](\/\/streamtape\.to\/get_video\?id=[^"']+)["']/);
-        if (directMatch) {
-          gateUrl = "https:" + directMatch[1];
+        const queryParamsMatch = html.match(/get_video\?(id=[^&'"]+&expires=\d+&ip=[^&'"]+&token=[a-zA-Z0-9_\-]+)/);
+        if (queryParamsMatch) {
+          gateUrl = `https://streamtape.to/get_video?${queryParamsMatch[1]}`;
+        }
+      }
+
+      // Strategy 4: Fallback concatenation search
+      if (!gateUrl) {
+        const idExpIp = html.match(/get_video\?(id=[^&'"]+&expires=[^&'"]+&ip=[^&'"]+)/);
+        const tokOnly = html.match(/['"](?:&|\?)token=([^'"]+)['"]/);
+        if (idExpIp && tokOnly) {
+          gateUrl = `https://streamtape.to/get_video?${idExpIp[1]}&token=${tokOnly[1]}`;
         }
       }
 
@@ -125,36 +134,56 @@ export default {
         gateUrl += "&stream=1";
       }
 
-      // 4. Hit Gate URL with mandatory Referer to fetch 302 location
-      const gateHeaders = {
-        "User-Agent": headers["User-Agent"],
-        "Accept": "*/*",
-        "Referer": embedUrl,
-      };
-
+      // 4. Resolve Tapecontent CDN Location (Server side)
       const gateRes = await fetch(gateUrl, {
-        headers: gateHeaders,
+        headers: {
+          "User-Agent": upstreamHeaders["User-Agent"],
+          "Accept": "*/*",
+          "Referer": embedUrl,
+        },
         redirect: "manual",
       });
 
-      // Streamtape returns HTTP 302 with Location header
-      let finalStreamUrl = gateRes.headers.get("Location");
-
-      // Agar direct 302 na mile to text check karein
-      if (!finalStreamUrl) {
-        const bodyText = await gateRes.text();
-        return new Response(bodyText, {
-          status: gateRes.status || 500,
-          headers: { "content-type": "application/json", "Access-Control-Allow-Origin": "*" }
-        });
+      let cdnStreamUrl = gateRes.headers.get("Location");
+      if (!cdnStreamUrl) {
+        cdnStreamUrl = gateRes.url;
       }
 
-      if (!finalStreamUrl.startsWith("http")) {
-        finalStreamUrl = "https:" + ("//" + finalStreamUrl.replace(/^\/+/, ""));
+      if (!cdnStreamUrl.startsWith("http")) {
+        cdnStreamUrl = "https:" + ("//" + cdnStreamUrl.replace(/^\/+/, ""));
       }
 
-      // 5. Direct 302 Redirect to video CDN
-      return Response.redirect(finalStreamUrl, 302);
+      // 5. DIRECT STREAM PLAYBACK (No Redirect to tapecontent)
+      // Client Range Header forward karte hain taaki forward/rewind aur video scrubbing work kare
+      const streamHeaders = new Headers();
+      streamHeaders.set("User-Agent", upstreamHeaders["User-Agent"]);
+      streamHeaders.set("Referer", embedUrl);
+
+      const clientRange = request.headers.get("Range");
+      if (clientRange) {
+        streamHeaders.set("Range", clientRange);
+      }
+
+      // Worker directly fetches binary stream from CDN
+      const videoPipe = await fetch(cdnStreamUrl, {
+        headers: streamHeaders,
+      });
+
+      // Headers prepare karein for native video playback
+      const responseHeaders = new Headers(videoPipe.headers);
+      responseHeaders.set("Content-Type", "video/mp4");
+      responseHeaders.set("Accept-Ranges", "bytes");
+      responseHeaders.set("Access-Control-Allow-Origin", "*");
+      responseHeaders.set("Access-Control-Allow-Headers", "*");
+      responseHeaders.set("Access-Control-Expose-Headers", "Content-Length, Content-Range, Accept-Ranges");
+      responseHeaders.set("Cache-Control", "no-cache, no-store, must-revalidate");
+
+      // Raw binary stream response client ko return karein
+      return new Response(videoPipe.body, {
+        status: videoPipe.status,
+        statusText: videoPipe.statusText,
+        headers: responseHeaders,
+      });
 
     } catch (err) {
       return new Response(
