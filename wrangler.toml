@@ -6,9 +6,3 @@ workers_dev = true
 
 [observability]
 enabled = true
-
-[vars]
-PROXY_HOST = "dc.oxylabs.io"
-PROXY_PORT = "8000"
-PROXY_USER = "user-cinio_w0bgG-country-US"
-PROXY_PASS = "5KQ9u=~pWBsC9K9"
