@@ -1,5 +1,15 @@
 export default {
   async fetch(request, env, ctx) {
+    const corsHeaders = {
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+      "Access-Control-Allow-Headers": "*",
+    };
+
+    if (request.method === "OPTIONS") {
+      return new Response(null, { headers: corsHeaders });
+    }
+
     const requestUrl = new URL(request.url);
     const targetUrl = requestUrl.searchParams.get("url");
 
@@ -12,10 +22,7 @@ export default {
         }, null, 2),
         {
           status: 400,
-          headers: {
-            "content-type": "application/json; charset=utf-8",
-            "Access-Control-Allow-Origin": "*"
-          },
+          headers: { ...corsHeaders, "Content-Type": "application/json; charset=utf-8" },
         }
       );
     }
@@ -25,8 +32,8 @@ export default {
       const idMatch = targetUrl.match(/\/(?:v|e)\/([a-zA-Z0-9]+)/);
       if (!idMatch) {
         return new Response(
-          JSON.stringify({ status: "error", message: "Invalid Streamtape URL format." }),
-          { status: 400, headers: { "content-type": "application/json", "Access-Control-Allow-Origin": "*" } }
+          JSON.stringify({ status: "error", message: "Invalid Streamtape URL format." }, null, 2),
+          { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json; charset=utf-8" } }
         );
       }
 
@@ -52,8 +59,8 @@ export default {
 
       if (!embedRes.ok) {
         return new Response(
-          JSON.stringify({ status: "error", message: `Upstream error: HTTP ${embedRes.status}` }),
-          { status: 502, headers: { "content-type": "application/json", "Access-Control-Allow-Origin": "*" } }
+          JSON.stringify({ status: "error", message: `Upstream error: HTTP ${embedRes.status}` }, null, 2),
+          { status: 502, headers: { ...corsHeaders, "Content-Type": "application/json; charset=utf-8" } }
         );
       }
 
@@ -61,12 +68,12 @@ export default {
 
       if (html.includes("Video not found") || html.includes("File was deleted")) {
         return new Response(
-          JSON.stringify({ status: "error", message: "Video not found or file was deleted by Streamtape." }),
-          { status: 404, headers: { "content-type": "application/json", "Access-Control-Allow-Origin": "*" } }
+          JSON.stringify({ status: "error", message: "Video not found or file was deleted by Streamtape." }, null, 2),
+          { status: 404, headers: { ...corsHeaders, "Content-Type": "application/json; charset=utf-8" } }
         );
       }
 
-      // 3. Extract Token via Slice Logic
+      // 3. Dynamic Token Extraction
       let gateUrl = null;
 
       const subMatch = html.match(/\+\s*\(?['"]([^'"]+)['"]\)?\.substring\((\d+)\)/);
@@ -90,8 +97,8 @@ export default {
 
       if (!gateUrl) {
         return new Response(
-          JSON.stringify({ status: "error", message: "Failed to extract dynamic token from Streamtape." }),
-          { status: 500, headers: { "content-type": "application/json", "Access-Control-Allow-Origin": "*" } }
+          JSON.stringify({ status: "error", message: "Failed to extract dynamic token from Streamtape." }, null, 2),
+          { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json; charset=utf-8" } }
         );
       }
 
@@ -99,7 +106,7 @@ export default {
         gateUrl += "&stream=1";
       }
 
-      // 4. Follow redirect manually to get final tapecontent CDN stream
+      // 4. Follow redirect to get final Tapecontent CDN stream link
       const gateRes = await fetch(gateUrl, {
         headers: {
           "User-Agent": browserHeaders["User-Agent"],
@@ -109,53 +116,38 @@ export default {
         redirect: "manual",
       });
 
-      let cdnStreamUrl = gateRes.headers.get("Location");
-      if (!cdnStreamUrl) {
-        cdnStreamUrl = gateRes.url;
+      let finalCdnUrl = gateRes.headers.get("Location");
+      if (!finalCdnUrl) {
+        finalCdnUrl = gateRes.url;
       }
 
-      if (!cdnStreamUrl.startsWith("http")) {
-        cdnStreamUrl = "https:" + ("//" + cdnStreamUrl.replace(/^\/+/, ""));
+      if (!finalCdnUrl.startsWith("http")) {
+        finalCdnUrl = "https:" + ("//" + finalCdnUrl.replace(/^\/+/, ""));
       }
 
-      // Agar direct playback parameter manga ho ya pipe fail ho raha ho
-      // Streamtape CDN se handshake check karein
-      const testHeaders = {
-        "User-Agent": browserHeaders["User-Agent"],
-        "Referer": embedUrl,
-      };
-      
-      const clientRange = request.headers.get("range");
-      if (clientRange) {
-        testHeaders["Range"] = clientRange;
-      }
-
-      const cdnRes = await fetch(cdnStreamUrl, {
-        headers: testHeaders,
-      });
-
-      // Agar Cloudflare IP ko Tapecontent ne 403 de diya:
-      if (cdnRes.status === 403 || cdnRes.status === 401) {
-        // Fallback: Browser ko direct CDN URL par redirect kar do
-        // User ke mobile browser ka real IP match ho jayega aur video chal jayegi
-        return Response.redirect(cdnStreamUrl, 302);
-      }
-
-      // Agar stream OK hai to pipe karein
-      const responseHeaders = new Headers(cdnRes.headers);
-      responseHeaders.set("Content-Type", "video/mp4");
-      responseHeaders.set("Accept-Ranges", "bytes");
-      responseHeaders.set("Access-Control-Allow-Origin", "*");
-
-      return new Response(cdnRes.body, {
-        status: cdnRes.status,
-        headers: responseHeaders,
-      });
+      // 5. Output Pure JSON
+      return new Response(
+        JSON.stringify({
+          status: "success",
+          video_id: videoId,
+          gate_url: gateUrl,
+          direct_cdn_url: finalCdnUrl,
+          timestamp: new Date().toISOString()
+        }, null, 2),
+        {
+          status: 200,
+          headers: {
+            ...corsHeaders,
+            "Content-Type": "application/json; charset=utf-8",
+            "Cache-Control": "no-store, no-cache, must-revalidate",
+          },
+        }
+      );
 
     } catch (err) {
       return new Response(
-        JSON.stringify({ status: "error", message: err.message }),
-        { status: 500, headers: { "content-type": "application/json", "Access-Control-Allow-Origin": "*" } }
+        JSON.stringify({ status: "error", message: err.message }, null, 2),
+        { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json; charset=utf-8" } }
       );
     }
   },
