@@ -28,7 +28,7 @@ export default {
     }
 
     try {
-      // 1. Video ID extract karein
+      // 1. Extract Video ID
       const idMatch = targetUrl.match(/\/(?:v|e)\/([a-zA-Z0-9]+)/);
       if (!idMatch) {
         return new Response(
@@ -64,10 +64,6 @@ export default {
         );
       }
 
-      // Capture cookies
-      const rawCookie = embedRes.headers.get("set-cookie") || "";
-      const cookieHeader = rawCookie.split(",").map(c => c.split(";")[0].trim()).filter(Boolean).join("; ");
-
       const html = await embedRes.text();
 
       if (html.includes("Video not found") || html.includes("File was deleted")) {
@@ -77,31 +73,46 @@ export default {
         );
       }
 
-      // 3. Dynamic Token Harvester
+      // 3. Target the Real 'robotlink' Line Only
       let gateUrl = null;
 
-      const subMatch = html.match(/\+\s*\(?['"]([^'"]+)['"]\)?\.substring\((\d+)\)/);
-      const basePartMatch = html.match(/['"]((?:https:)?\/\/streamtape\.to\/get_video\?[^'"]+)['"]/);
+      // Extract specifically the robotlink line from the bottom script
+      const robotMatches = [...html.matchAll(/document\.getElementById\(['"]robotlink['"]\)\.innerHTML\s*=\s*(.*?);/g)];
+      
+      if (robotMatches.length > 0) {
+        // Take the last assignment (the real one)
+        const lastExpr = robotMatches[robotMatches.length - 1][1];
 
-      if (subMatch && basePartMatch) {
-        let basePart = basePartMatch[1];
-        if (basePart.startsWith("//")) basePart = "https:" + basePart;
-        const rawToken = subMatch[1];
-        const offset = parseInt(subMatch[2], 10);
-        const token = rawToken.substring(offset);
-        gateUrl = `${basePart}&token=${token}`;
+        // Match string: '//stream' + ('xcdtape.to/get_video?id=...&token=...').substring(2).substring(1)
+        const strMatch = lastExpr.match(/\(\s*['"]([^'"]+tape\.to\/get_video\?[^'"]+)['"]\s*\)/);
+        const slices = [...lastExpr.matchAll(/\.substring\((\d+)\)/g)].map(m => parseInt(m[1], 10));
+
+        if (strMatch) {
+          let resolved = strMatch[1];
+          for (const s of slices) {
+            resolved = resolved.substring(s);
+          }
+          gateUrl = "https://" + resolved.replace(/^\/+/, "");
+        }
       }
 
+      // Fallback parser if robotlink structure alters slightly
       if (!gateUrl) {
-        const queryParamsMatch = html.match(/get_video\?(id=[^&'"]+&expires=\d+&ip=[^&'"]+&token=[a-zA-Z0-9_\-]+)/);
-        if (queryParamsMatch) {
-          gateUrl = `https://streamtape.to/get_video?${queryParamsMatch[1]}`;
+        const anyScriptTokens = [...html.matchAll(/\(\s*['"]([^'"]+tape\.to\/get_video\?[^'"]+)['"]\s*\)((\.substring\(\d+\))+)/g)];
+        if (anyScriptTokens.length > 0) {
+          const last = anyScriptTokens[anyScriptTokens.length - 1];
+          let resolved = last[1];
+          const innerSlices = [...last[2].matchAll(/\.substring\((\d+)\)/g)].map(m => parseInt(m[1], 10));
+          for (const s of innerSlices) {
+            resolved = resolved.substring(s);
+          }
+          gateUrl = "https://" + resolved.replace(/^\/+/, "");
         }
       }
 
       if (!gateUrl) {
         return new Response(
-          JSON.stringify({ status: "error", message: "Failed to extract dynamic token." }, null, 2),
+          JSON.stringify({ status: "error", message: "Failed to extract real robotlink token." }, null, 2),
           { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json; charset=utf-8" } }
         );
       }
@@ -110,48 +121,27 @@ export default {
         gateUrl += "&stream=1";
       }
 
-      // 4. Resolve CDN Link via Range Header Probe
-      // Streamtape HEAD request par redirect nahi deta; isliye GET with Range: bytes=0-0 bhejte hain
+      // 4. Follow gate URL with Referer to fetch final .tapecontent.net CDN Link
       const gateHeaders = {
         "User-Agent": browserHeaders["User-Agent"],
         "Accept": "*/*",
         "Referer": embedUrl,
-        "Range": "bytes=0-0",
       };
 
-      if (cookieHeader) {
-        gateHeaders["Cookie"] = cookieHeader;
-      }
-
-      const streamProbe = await fetch(gateUrl, {
-        method: "GET",
+      const gateRes = await fetch(gateUrl, {
         headers: gateHeaders,
         redirect: "follow",
       });
 
-      let finalCdnUrl = streamProbe.url;
+      const finalCdnUrl = gateRes.url;
 
-      // Agar direct URL abhi bhi get_video hai, to response body check karein
-      // (kuch cases me Streamtape redirect ke badle window.location ya intermediate URL deta hai)
-      let debugInfo = "streamProbe ok";
-      if (!finalCdnUrl.includes("tapecontent.net")) {
-        const probeText = await streamProbe.text();
-        const cdnInBody = probeText.match(/https?:\/\/[a-zA-Z0-9_\.\-]*tapecontent\.net[^\s"'<>]+/);
-        if (cdnInBody) {
-          finalCdnUrl = cdnInBody[0];
-        } else {
-          debugInfo = `Status: ${streamProbe.status}, Body snippet: ${probeText.slice(0, 150)}`;
-        }
-      }
-
-      // 5. Output Final Clean JSON
+      // 5. Output Pure Clean JSON
       return new Response(
         JSON.stringify({
           status: "success",
           video_id: videoId,
-          gate_url: gateUrl,
+          real_gate_url: gateUrl,
           direct_cdn_url: finalCdnUrl,
-          debug: debugInfo,
           timestamp: new Date().toISOString()
         }, null, 2),
         {
